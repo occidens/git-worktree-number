@@ -2,7 +2,9 @@
 
 set -eu
 
-PREFIX=refs/kv
+KV_PREFIX=refs/kv
+LK_PREFIX=refs/lck
+
 FORTY_NOUGHTS=$(printf '%040d\n' 0)
 
 warn() {
@@ -29,13 +31,66 @@ with_author () {
     "$@"
 }
 
+# -- Ref-based locking -- #
+
+reflock_gen () {
+    printf '%s:%s:%s' "$$" "$RANDOM" "$(date -u +%Y%m%dT%H%M%SZ)" | git hash-object -w --stdin
+}
+
+reflock_try () {
+    local name="$1"
+    local hash
+    hash="${2:-$(reflock_gen)}"
+
+    if git update-ref "${LK_PREFIX}/${name}" "$hash" "$FORTY_NOUGHTS" 2>/dev/null; then
+        printf '%s\n' "$hash"
+    else
+        return 1
+    fi
+}
+
+reflock_wait () {
+    local name="$1"
+    local timeout=5
+    local stop=$((SECONDS + timeout))
+    local success=0
+    local hash
+
+    hash=$(printf '%s:%s:%s' "$$" "$RANDOM" "$(date -u +%Y%m%dT%H%M%SZ)" | git hash-object -w --stdin)
+
+    while true; do
+        if reflock_try "$hash"; then
+            success=1
+            break
+        fi
+
+        if (( SECONDS >= stop )); then
+            break
+        fi
+
+        sleep 0.1
+    done
+
+    if [ "$success" = 1 ]; then
+        printf '%s\n' "$hash"
+    else
+        return 1
+    fi
+}
+
+reflock_release () {
+    local name="$1"
+    local hash="$2"
+    git update-ref -d "${LK_PREFIX}/${name}" "$hash"
+}
+
 # -- KV Store -- #
 
 txn_begin() {
     local ns="$1"
-    local ref="${PREFIX}/${ns}"
+    local ref="${KV_PREFIX}/${ns}"
 
-    TXN_REF="${PREFIX}/${ns}"; export TXN_REF
+    TXN_REF="${KV_PREFIX}/${ns}"; export TXN_REF
     TXN_BASE=$(git rev-parse --verify -q "$TXN_REF" || true); export TXN_BASE
     GIT_INDEX_FILE=$(mktemp); export GIT_INDEX_FILE
     trap drop_index EXIT
@@ -61,7 +116,7 @@ txn_commit () {
 
 kv_ref () {
     local ns="$1"
-    local ref="${PREFIX}/${ns}"
+    local ref="${KV_PREFIX}/${ns}"
 
     if git check-ref-format "${ref}"; then
         printf '%s\n' "${ref}"
@@ -90,7 +145,7 @@ kv_set() {
     local key="$2"
     local value="$3"
 
-    local ref="${PREFIX}/${ns}"
+    local ref="${KV_PREFIX}/${ns}"
     local base
     local hash
 
@@ -126,12 +181,12 @@ kv_clear () {
 
 kv_log () {
     local ns="$1"
-    git log "${PREFIX}/${ns}"
+    git log "${KV_PREFIX}/${ns}"
 }
 
 kv_keys() {
     local ns="$1"
-    local ref="${PREFIX}/${ns}"
+    local ref="${KV_PREFIX}/${ns}"
 
     git ls-tree --name-only "${ref}:keys"
 }
@@ -143,7 +198,7 @@ kv_values() {
 
     local ns="$1"; shift
     local delim='\n'
-    local ref="${PREFIX}/${ns}"
+    local ref="${KV_PREFIX}/${ns}"
 
     git ls-tree -z --object-only "${ref}:keys" "$@" \
         | git cat-file -Z --batch= \
@@ -288,8 +343,32 @@ main_kv () {
         values)
             kv_values "$@"
             ;;
+        get-lock)
+            lock_get "$@"
+            ;;
+        release-lock)
+            lock_release "$@"
+            ;;
         *)
             echo "Usage: $0 <get|set> <namespace> <key> [value]"
+            exit 1
+    esac
+}
+
+main_reflock() {
+        local cmd="$1"; shift
+            case "$cmd" in
+        try)
+            reflock_try "$@"
+            ;;
+        wait)
+            reflock_wait "$@"
+            ;;
+        release)
+            reflock_release "$@"
+            ;;
+        *)
+            echo "Usage: $0 <get|release> <name> ..."
             exit 1
     esac
 }
@@ -326,6 +405,9 @@ main () {
     case "$bin" in
         git-kv)
             main_kv "$@"
+        ;;
+        git-reflock)
+            main_reflock "$@"
         ;;
         *)
             main_wt "$@"

@@ -6,7 +6,7 @@ The primary motivation for this is to assign unique port numbers when developing
 
 Worktree numbers are stored in a rudimentary key-value store build on top of git custom refs. By leaning on git's built-in locking mechanisms, I hope to ensure that it is impossible for concurrent executions of this command to issue overlapping worktree numbers or clobber the store.
 
-Note: When this command is run as `git-kv` you get access to some primitive commands for interacting with key-value stores.
+Note: When run as `git-kv` or `git-reflock` this command provides different subcommands that give access to the some of the primitives used by the main command.
 
 ## TODO
 
