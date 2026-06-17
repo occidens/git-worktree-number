@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+
+set -eu
+
+PREFIX=refs/kv
+FORTY_NOUGHTS=$(printf '%040d\n' 0)
+
+warn() {
+    local msg="$1"
+    >&2 echo "${msg}"
+}
+
+die() {
+    local code="${1:-1}"
+    local msg="$2"
+
+    >&2 echo "${msg}"
+    exit "$code"
+}
+
+# -- KV Store -- #
+
+with_author () {
+    local name=${GIT_AUTHOR_NAME:-Git KV}
+    local email=${GIT_AUTHOR_EMAIL:-kv@localhost}
+
+    GIT_AUTHOR_NAME=${name} \
+    GIT_AUTHOR_EMAIL=${email} \
+    GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME:-$name} \
+    GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-$email} \
+    "$@"
+}
+
+txn_begin() {
+    local ns="$1"
+    local ref="${PREFIX}/${ns}"
+
+    TXN_REF="${PREFIX}/${ns}"; export TXN_REF
+    TXN_BASE=$(git rev-parse --verify -q "$TXN_REF" || true); export TXN_BASE
+    GIT_INDEX_FILE=$(mktemp); export GIT_INDEX_FILE
+    trap drop_index EXIT
+
+    if [ -n "$TXN_BASE" ]; then
+        git read-tree "$TXN_BASE"
+    else
+        git read-tree --empty
+    fi
+}
+
+txn_commit () {
+    local msg="$1"
+    local base="$TXN_BASE"
+
+    tree=$(git write-tree)
+    commit=$(with_author git commit-tree "$tree" ${base:+-p "$base"} ${msg:+-m "$msg"})
+    git update-ref "$TXN_REF" "$commit" "${base:-$FORTY_NOUGHTS}" 2>/dev/null
+
+    unset TXN_BASE
+    unset TXN_REF
+}
+
+kv_ref () {
+    local ns="$1"
+    local ref="${PREFIX}/${ns}"
+
+    if git check-ref-format "${ref}"; then
+        printf '%s\n' "${ref}"
+    else
+        die 1 "Invalid namespace ${ns}"
+    fi
+}
+
+# kv_validref () {
+#     git update-ref --stdin <<EOF >/dev/null 2>&1
+#         a
+# EOF
+# }
+
+kv_get() {
+    local ns="$1"
+    local key="$2"
+    local ref
+    ref=$(kv_ref "$ns")
+
+    git cat-file -p "${ref}:keys/${key}"
+}
+
+kv_set() {
+    local ns="$1"
+    local key="$2"
+    local value="$3"
+
+    local ref="${PREFIX}/${ns}"
+    local base
+    local hash
+
+    txn_begin "$ns"
+
+    hash=$(printf '%s' "$value" | git hash-object -w --stdin)
+    git update-index --add --cacheinfo "100644,${hash},keys/${key}"
+
+    txn_commit "kv: ${key} => ${value}"
+}
+
+kv_delete() {
+    local ns="$1"; shift
+
+    txn_begin "$ns"
+
+    for key in "$@"; do
+        git update-index --force-remove "keys/${key}"
+    done
+
+    txn_commit "kv: $# keys deleted"
+}
+
+kv_clear () {
+    local ns="$1"
+
+    txn_begin "$ns"
+
+    git read-tree --empty
+
+    txn_commit "kv: clear"
+}
+
+kv_log () {
+    local ns="$1"
+    git log "${PREFIX}/${ns}"
+}
+
+kv_keys() {
+    local ns="$1"
+    local ref="${PREFIX}/${ns}"
+
+    git ls-tree --name-only "${ref}:keys"
+}
+
+kv_values() {
+    if [[ "${1:-}" == "-d" ]]; then
+        delim="$2"; shift 2
+    fi
+
+    local ns="$1"; shift
+    local delim='\n'
+    local ref="${PREFIX}/${ns}"
+
+    git ls-tree -z --object-only "${ref}:keys" "$@" \
+        | git cat-file -Z --batch= \
+        | xargs -0 printf '%s'"$delim"
+}
+
+
+drop_index() {
+    if [ -n "${GIT_INDEX_FILE:-}" ]; then
+        rm -f "$GIT_INDEX_FILE"
+        unset GIT_INDEX_FILE
+    fi
+}
+
+
+
+wt_id () {
+    local workdir="${1:-}"
+    local id
+    local gitdir
+
+    gitdir=$(git ${workdir:+-C "$workdir"} rev-parse --absolute-git-dir)
+
+    case "$gitdir" in
+        */worktrees/*)
+            id=$(basename "$gitdir")
+            ;;
+        *)
+            id=main
+            ;;
+    esac
+
+    echo "$id"
+}
+
+wt_ids () {
+    local line
+    while IFS= read -r -d '' line; do
+        if [[ $line == "worktree "* ]]; then
+            wt_id "${line#worktree }"
+        fi
+    done < <(git worktree list --porcelain -z)
+}
+
+wt_orphan_ids () {
+    # Args to `comm` are the columns to suppress!
+    comm -23 <( kv_keys worktrees | sort ) <( wt_ids | sort )
+}
+
+wt_prune() {
+    local orphan_ids=()
+    local orphan_nums=()
+
+    while IFS= read -r id; do
+        orphan_ids+=( "$id" )
+    done < <(wt_orphan_ids)
+
+    while IFS= read -r num; do
+        orphan_nums+=( "$num" )
+    done < <(kv_values worktrees "${orphan_ids[@]}")
+
+    kv_delete worktrees "${orphan_ids[@]}"
+    kv_delete numbers "${orphan_nums[@]}"
+}
+
+wt_num () {
+    local id
+    id=$(wt_id)
+
+    existing=$(kv_get worktrees "$id" 2>/dev/null || true)
+
+    if [ -n "$existing" ]; then
+        echo "$existing"
+        return
+    fi
+
+    used=$(kv_keys numbers 2>/dev/null | sort -n || true )
+
+    N=0;
+    while printf '%s\n' "$used" | grep -qx "$N"
+    do
+        N=$((N+1))
+    done
+
+    kv_set numbers "$N" "$id"
+    kv_set worktrees "$id" "$N"
+
+    echo "$N"
+}
+
+
+main_kv () {
+    local cmd="$1"; shift
+    case "$cmd" in
+        get)
+            kv_get "$@"
+            ;;
+        set)
+            kv_set "$@"
+            ;;
+        log)
+            kv_log "$@"
+            ;;
+        delete)
+            kv_delete "$@"
+            ;;
+        keys)
+            kv_keys "$@"
+            ;;
+        values)
+            kv_values "$@"
+            ;;
+        *)
+            echo "Usage: $0 <get|set> <namespace> <key> [value]"
+            exit 1
+    esac
+}
+
+main_wt () {
+    local cmd="$1"; shift
+        case "$cmd" in
+        id)
+            wt_id "$@"
+            ;;
+        ids)
+            wt_ids "$@"
+            ;;
+        num)
+            wt_num "$@"
+            ;;
+        prune)
+            wt_prune "$@"
+            ;;
+        *)
+            echo "Usage: $0 <get|set> <namespace> <key> [value]"
+            exit 1
+    esac
+}
+
+main () {
+    local bin
+    bin=$(basename "$0")
+
+    case "$bin" in
+        git-kv)
+            main_kv "$@"
+        ;;
+        git-wkt)
+            main_wt "$@"
+        ;;
+        *)
+            echo "Err!"
+            exit 1
+    esac
+}
+
+main "$@"
