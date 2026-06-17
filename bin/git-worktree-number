@@ -291,7 +291,7 @@ main () {
         git-kv)
             main_kv "$@"
         ;;
-        git-wkt)
+        git-worktree-number)
             main_wt "$@"
         ;;
         *)
