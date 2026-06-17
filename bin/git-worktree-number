@@ -18,8 +18,6 @@ die() {
     exit "$code"
 }
 
-# -- KV Store -- #
-
 with_author () {
     local name=${GIT_AUTHOR_NAME:-Git KV}
     local email=${GIT_AUTHOR_EMAIL:-kv@localhost}
@@ -30,6 +28,8 @@ with_author () {
     GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL:-$email} \
     "$@"
 }
+
+# -- KV Store -- #
 
 txn_begin() {
     local ns="$1"
@@ -158,9 +158,9 @@ drop_index() {
     fi
 }
 
+# -- Worktree  -- #
 
-
-wt_id () {
+wkt_id () {
     local workdir="${1:-}"
     local id
     local gitdir
@@ -179,27 +179,85 @@ wt_id () {
     echo "$id"
 }
 
-wt_ids () {
+wkt_ids () {
     local line
     while IFS= read -r -d '' line; do
         if [[ $line == "worktree "* ]]; then
-            wt_id "${line#worktree }"
+            wkt_id "${line#worktree }"
         fi
     done < <(git worktree list --porcelain -z)
 }
 
-wt_orphan_ids () {
-    # Args to `comm` are the columns to suppress!
-    comm -23 <( kv_keys worktrees | sort ) <( wt_ids | sort )
+wkt_num () {
+    local workdir="${1:-}"
+    local id
+    local num
+
+    id=$(wkt_id "$workdir")
+
+    num=$(kv_get worktrees "$id" 2>/dev/null || true)
+
+    if [ -n "$num" ]; then
+        echo "$num"
+        return
+    fi
+
+    local assigned=()
+
+    while IFS= read -r n; do
+        if [ -n "$n" ]; then
+            assigned[n]=1
+        fi
+    done < <(kv_keys numbers 2>/dev/null || true )
+
+    num=0
+    while [ -n "${assigned[$num]:-}" ]; do
+        num=$((num+1))
+    done
+
+    kv_set numbers "$num" "$id"
+    kv_set worktrees "$id" "$num"
+
+    echo "$num"
 }
 
-wt_prune() {
+wkt_show() {
+    local pth="$1"
+    local num
+
+    num=$(wkt_num "$pth")
+
+    printf '%s\t%4d\n' "$pth" "$num"
+}
+
+wkt_list () {
+    for_each_worktree wkt_show | column -t -s $'\t'
+}
+
+for_each_worktree () {
+    local line
+    local path
+
+    while IFS= read -r -d '' line; do
+        if [[ $line == "worktree "* ]]; then
+        path="${line#worktree }"
+            "$@" "$path"
+        fi
+    done < <(git worktree list --porcelain -z)
+}
+
+wkt_orphan_ids () {
+    # Args to `comm` are the columns to suppress!
+    comm -23 <( kv_keys worktrees | sort ) <( wkt_ids | sort )
+}
+
+wkt_prune() {
     local orphan_ids=()
     local orphan_nums=()
 
     while IFS= read -r id; do
         orphan_ids+=( "$id" )
-    done < <(wt_orphan_ids)
+    done < <(wkt_orphan_ids)
 
     while IFS= read -r num; do
         orphan_nums+=( "$num" )
@@ -208,32 +266,6 @@ wt_prune() {
     kv_delete worktrees "${orphan_ids[@]}"
     kv_delete numbers "${orphan_nums[@]}"
 }
-
-wt_num () {
-    local id
-    id=$(wt_id)
-
-    existing=$(kv_get worktrees "$id" 2>/dev/null || true)
-
-    if [ -n "$existing" ]; then
-        echo "$existing"
-        return
-    fi
-
-    used=$(kv_keys numbers 2>/dev/null | sort -n || true )
-
-    N=0;
-    while printf '%s\n' "$used" | grep -qx "$N"
-    do
-        N=$((N+1))
-    done
-
-    kv_set numbers "$N" "$id"
-    kv_set worktrees "$id" "$N"
-
-    echo "$N"
-}
-
 
 main_kv () {
     local cmd="$1"; shift
@@ -263,19 +295,23 @@ main_kv () {
 }
 
 main_wt () {
-    local cmd="$1"; shift
-        case "$cmd" in
+    local cmd="${1:-num}"
+    if [ $# -gt 0 ]; then
+        shift
+    fi
+
+    case "$cmd" in
         id)
-            wt_id "$@"
-            ;;
-        ids)
-            wt_ids "$@"
+            wkt_id "$@"
             ;;
         num)
-            wt_num "$@"
+            wkt_num "$@"
+            ;;
+        list)
+            wkt_list "$@"
             ;;
         prune)
-            wt_prune "$@"
+            wkt_prune "$@"
             ;;
         *)
             echo "Usage: $0 <get|set> <namespace> <key> [value]"
@@ -291,12 +327,8 @@ main () {
         git-kv)
             main_kv "$@"
         ;;
-        git-worktree-number)
-            main_wt "$@"
-        ;;
         *)
-            echo "Err!"
-            exit 1
+            main_wt "$@"
     esac
 }
 
