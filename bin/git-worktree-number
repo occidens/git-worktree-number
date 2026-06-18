@@ -45,6 +45,7 @@ reflock_try () {
     if git update-ref "${LK_PREFIX}/${name}" "$hash" "$FORTY_NOUGHTS" 2>/dev/null; then
         printf '%s\n' "$hash"
     else
+        warn "Failed to obtain lock \"${name}\""
         return 1
     fi
 }
@@ -56,15 +57,16 @@ reflock_wait () {
     local success=0
     local hash
 
-    hash=$(printf '%s:%s:%s' "$$" "$RANDOM" "$(date -u +%Y%m%dT%H%M%SZ)" | git hash-object -w --stdin)
+    hash=$(reflock_gen)
 
     while true; do
-        if reflock_try "$hash"; then
+        if reflock_try "$name" "$hash" >/dev/null 2>&1; then
             success=1
             break
         fi
 
         if (( SECONDS >= stop )); then
+            warn "Timed out waiting for lock \"${name}\""
             break
         fi
 
@@ -81,7 +83,10 @@ reflock_wait () {
 reflock_release () {
     local name="$1"
     local hash="$2"
-    git update-ref -d "${LK_PREFIX}/${name}" "$hash"
+
+    if ! git update-ref -d "${LK_PREFIX}/${name}" "$hash"; then
+        warn "Failed to release lock \"${name}\""
+    fi
 }
 
 # -- KV Store -- #
@@ -247,6 +252,7 @@ wkt_num () {
     local workdir="${1:-}"
     local id
     local num
+    local lock
 
     id=$(wkt_id "$workdir")
 
@@ -257,23 +263,29 @@ wkt_num () {
         return
     fi
 
-    local assigned=()
+    if lock="$(reflock_wait worktree)"; then
+        local assigned=()
 
-    while IFS= read -r n; do
-        if [ -n "$n" ]; then
-            assigned[n]=1
-        fi
-    done < <(kv_keys numbers 2>/dev/null || true )
+        while IFS= read -r n; do
+            if [ -n "$n" ]; then
+                assigned[n]=1
+            fi
+        done < <(kv_keys numbers 2>/dev/null || true )
 
-    num=0
-    while [ -n "${assigned[$num]:-}" ]; do
-        num=$((num+1))
-    done
+        num=0
+        while [ -n "${assigned[$num]:-}" ]; do
+            num=$((num+1))
+        done
 
-    kv_set numbers "$num" "$id"
-    kv_set worktrees "$id" "$num"
+        kv_set numbers "$num" "$id"
+        kv_set worktrees "$id" "$num"
 
-    echo "$num"
+        reflock_release worktree "$lock"
+
+        echo "$num"
+    else
+        die 1 "Unable to obtain lock"
+    fi
 }
 
 wkt_show() {
@@ -307,19 +319,27 @@ wkt_orphan_ids () {
 }
 
 wkt_prune() {
-    local orphan_ids=()
-    local orphan_nums=()
+    local lock
 
-    while IFS= read -r id; do
-        orphan_ids+=( "$id" )
-    done < <(wkt_orphan_ids)
+    if lock="$(reflock_wait worktree)"; then
+        local orphan_ids=()
+        local orphan_nums=()
 
-    while IFS= read -r num; do
-        orphan_nums+=( "$num" )
-    done < <(kv_values worktrees "${orphan_ids[@]}")
+        while IFS= read -r id; do
+            orphan_ids+=( "$id" )
+        done < <(wkt_orphan_ids)
 
-    kv_delete worktrees "${orphan_ids[@]}"
-    kv_delete numbers "${orphan_nums[@]}"
+        while IFS= read -r num; do
+            orphan_nums+=( "$num" )
+        done < <(kv_values worktrees "${orphan_ids[@]}")
+
+        kv_delete worktrees "${orphan_ids[@]}"
+        kv_delete numbers "${orphan_nums[@]}"
+
+        reflock_release worktree "$lock"
+    else
+        die 1 "Unable to obtain lock"
+    fi
 }
 
 main_kv () {
