@@ -130,12 +130,6 @@ kv_ref () {
     fi
 }
 
-# kv_validref () {
-#     git update-ref --stdin <<EOF >/dev/null 2>&1
-#         a
-# EOF
-# }
-
 kv_get() {
     local ns="$1"
     local key="$2"
