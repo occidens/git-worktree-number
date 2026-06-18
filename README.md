@@ -4,7 +4,13 @@
 
 ```
 # Print a unique (in repo scope) non-negative integer for the current worktree
-git worktree-number [num]      # print
+git worktree-number [num]
+
+# Print the worktree number offset by the specified value
+git worktree-number offset 10
+
+# Run a command with WORKTREE_NUMBER assigned
+git worktree-number run sh -c 'echo $WORKTREE_NUMBER'
 
 # List all worktrees with their assigned numbers
 git worktree-number list

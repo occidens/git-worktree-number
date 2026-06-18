@@ -288,6 +288,20 @@ wkt_num () {
     fi
 }
 
+wkt_offset () {
+    local offset="$1"
+    local num
+    num=$(wkt_num)
+    printf '%d\n' $((num + offset))
+}
+
+wkt_run () {
+    local num
+    num=$(wkt_num)
+
+    WORKTREE_NUMBER="$num" exec "$@"
+}
+
 wkt_show() {
     local pth="$1"
     local num
@@ -411,6 +425,12 @@ main_wt () {
             ;;
         prune)
             wkt_prune "$@"
+            ;;
+        offset)
+            wkt_offset "$@"
+            ;;
+        run)
+            wkt_run "$@"
             ;;
         *)
             echo "Usage: $0 <get|set> <namespace> <key> [value]"
