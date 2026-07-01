@@ -89,6 +89,59 @@ reflock_release () {
     fi
 }
 
+# -- Transactional -- #
+
+begin_atomic () {
+    local tempdir
+    tempdir="$(mktemp -d)"
+    trap 'rm -rf "$tempdir"' EXIT
+
+    local pi="$tempdir/in"
+    local po="$tempdir/out"
+
+    mkfifo "$pi" "$po"
+
+    TXN_ACTIVE=1; export TXN_ACTIVE
+
+    git update-ref -z --stdin < "$pi" > "$po" &
+    pid=$!
+
+    exec 3<>"$pi"      # fd 3: write -> git stdin
+    exec 4<>"$po"     # fd 4: read  <- git stdout
+    rm -f "$pi" "$po"
+
+    _send start
+}
+
+_send() {
+    local cmd="$1"
+    printf '%s\0' "$cmd"
+    read -ru 4 res
+    printf '%s' "$res"
+}
+
+_update() {
+    local ref="$1"
+    local new_oid="$2"
+    local old_oid="$3"
+
+    printf 'update %s\0%s\0%s\0' "$ref" "$new_oid" "$old_oid" >&3
+    read -ru 4 res
+
+    printf '%s' "$res"
+}
+
+end_atomic () {
+    _send prepare
+    _send commit
+
+    exec 3>&-      # Close first, triggering git exit
+    wait "$pid"    # Wait for exit
+    exec 4<&-      # Finally close
+    unset TXN_ACTIVE
+    return $?
+}
+
 # -- KV Store -- #
 
 txn_begin() {
